@@ -7,6 +7,7 @@ use crate::{error::Error, stream::StreamHandle};
 
 pub(crate) enum Command {
     OpenStream(oneshot::Sender<Result<StreamHandle, Error>>),
+    LatestPing(oneshot::Sender<Result<u64, Error>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -24,6 +25,16 @@ impl Control {
         let (tx, rx) = oneshot::channel();
         self.0
             .send(Command::OpenStream(tx))
+            .await
+            .map_err(|_| Error::SessionShutdown)?;
+        rx.await.map_err(|_| Error::SessionShutdown)?
+    }
+
+    /// latest_ping returns the latest ping time in milliseconds.
+    pub async fn latest_ping(&mut self) -> Result<u64, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send(Command::LatestPing(tx))
             .await
             .map_err(|_| Error::SessionShutdown)?;
         rx.await.map_err(|_| Error::SessionShutdown)?

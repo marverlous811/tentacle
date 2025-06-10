@@ -106,6 +106,7 @@ pub struct Session<T> {
     control_receiver: Receiver<Command>,
 
     keepalive: Option<Interval>,
+    latest_ping: Instant,
     /// wasi use time mock to recording time changes
     /// yamux's timeout statistics are session independent
     #[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
@@ -185,6 +186,7 @@ where
             control_sender,
             control_receiver,
             keepalive,
+            latest_ping: Instant::now(),
             #[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
             time_mock,
         }
@@ -336,6 +338,11 @@ where
     #[inline]
     fn send_all(&mut self, cx: &mut Context) -> Result<bool, io::Error> {
         while let Some(frame) = self.write_pending_frames.pop_front() {
+            debug!(
+                "[session][send_all] got a pending frame, will sending {:?}, {:?}",
+                frame.ty(),
+                frame
+            );
             if self.is_dead() {
                 break;
             }
@@ -344,10 +351,14 @@ where
 
             match sink.as_mut().poll_ready(cx)? {
                 Poll::Ready(()) => {
+                    debug!("[session][send_all] start send");
                     sink.as_mut().start_send(frame)?;
                 }
                 Poll::Pending => {
-                    debug!("[{:?}] framed_stream NotReady, frame: {:?}", self.ty, frame);
+                    debug!(
+                        "[session][send_all][{:?}] framed_stream NotReady, frame: {:?}",
+                        self.ty, frame
+                    );
                     self.write_pending_frames.push_front(frame);
 
                     if self.poll_complete(cx)? {
@@ -506,20 +517,25 @@ where
     fn handle_ping(&mut self, cx: &mut Context, frame: &Frame) -> Result<(), io::Error> {
         let flags = frame.flags();
         if flags.contains(Flag::Syn) {
+            debug!("[handle_ping] got a SYNC will send ping back...");
             // Send ping back
             self.send_ping(cx, Some(frame.length()))?;
         } else if flags.contains(Flag::Ack) {
+            debug!("[handle_ping] got a ACK, keep alive");
             self.pings.remove(&frame.length());
             // If the remote peer does not follow the protocol,
             // there may be a memory leak, so here need to discard all ping ids below the ack.
             self.pings = self.pings.split_off(&frame.length());
+            self.latest_ping = Instant::now();
         } else {
             // TODO: unexpected case, send a GoAwayCode::ProtocolError ?
+            debug!("[handle_ping] other....")
         }
         Ok(())
     }
 
     fn handle_go_away(&mut self, cx: &mut Context, frame: &Frame) -> Result<(), io::Error> {
+        debug!("[session][handle_go_away] got a go away frame {:?}", frame);
         let mut close = || -> Result<(), io::Error> {
             self.remote_go_away = true;
             self.write_pending_frames.clear();
@@ -603,6 +619,9 @@ where
                     Command::OpenStream(tx) => {
                         let _ignore = tx.send(self.open_stream());
                     }
+                    Command::LatestPing(tx) => {
+                        let _ignore = tx.send(Ok(self.latest_ping.elapsed().as_millis() as u64));
+                    }
                     Command::Shutdown(tx) => {
                         self.shutdown(cx)?;
                         let _ignore = tx.send(());
@@ -627,6 +646,7 @@ where
     type Item = Result<StreamHandle, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        debug!("[session][poll_next] on poll");
         if self.is_dead() {
             debug!("yamux::Session finished because is_dead");
             return Poll::Ready(None);
@@ -668,7 +688,8 @@ where
 
         let mut need_wake = false;
 
-        for _ in 0..16 {
+        for i in 0..16 {
+            debug!("[session][poll_next] on tick {i}");
             if self.is_dead() {
                 debug!("yamux::Session finished because is_dead, end");
                 return Poll::Ready(None);
